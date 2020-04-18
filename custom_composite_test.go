@@ -6,6 +6,8 @@ import (
 	"os"
 
 	"github.com/jackc/pgtype"
+
+	pgbinary "github.com/jackc/pgtype/binary"
 	pgx "github.com/jackc/pgx/v4"
 	errors "golang.org/x/xerrors"
 )
@@ -53,6 +55,61 @@ func (src MyType) EncodeBinary(ci *pgtype.ConnInfo, buf []byte) (newBuf []byte, 
 	return pgtype.EncodeRow(ci, buf, &a, &b)
 }
 
+type MyTypeArray []MyType
+
+type ArrayHeaderCb func(nullArray bool, elementCount int, dims []pgbinary.ArrayDimension, oid uint32) error
+type ArrayElementCb func(isNull bool, pos int, ci *pgtype.ConnInfo, src []byte) error
+
+func Array(alloc ArrayHeaderCb, decode ArrayElementCb) pgtype.BinaryDecoderFunc {
+	return func(ci *pgtype.ConnInfo, src []byte) error {
+		if src == nil {
+			return alloc(true, 0, nil, 0)
+		}
+
+		it, elementCount, dims, oid, err := pgbinary.NewArrayIterator(src)
+		if err != nil {
+			return err
+		}
+
+		if err = alloc(false, elementCount, dims, oid); err != nil {
+			return err
+		}
+
+		for i := 0; len(it) > 0; i++ {
+			isNull, elemBytes, err := it.NextElem()
+			if err != nil {
+				return err
+			}
+			if err := decode(isNull, i, ci, elemBytes); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+func MyTypeArrayDecoder(dst *MyTypeArray) pgtype.BinaryDecoder {
+	alloc := func(isNull bool, elementCount int, dims []pgbinary.ArrayDimension, oid uint32) error {
+		if isNull {
+			*dst = nil
+		} else if len(*dst) < elementCount {
+			*dst = append(*dst, make([]MyType, (elementCount-len(*dst)))...)
+		}
+		return nil
+	}
+	decode := func(isNull bool, i int, ci *pgtype.ConnInfo, elemBytes []byte) error {
+		if isNull {
+			return errors.Errorf("ARRAY's %d th element is NULL, decode into slice of pointers instead", i)
+		}
+		return (*dst)[i].DecodeBinary(ci, elemBytes)
+	}
+	return Array(alloc, decode)
+}
+
+func (dst *MyTypeArray) DecodeBinary(ci *pgtype.ConnInfo, src []byte) error {
+	return MyTypeArrayDecoder(dst).DecodeBinary(ci, src)
+}
+
 func ptrS(s string) *string {
 	return &s
 }
@@ -86,8 +143,17 @@ create type mytype as (
 		pgx.QueryResultFormats{pgx.BinaryFormatCode}, MyType{1, ptrS("foo")}).
 		Scan(&result)
 	E(err)
-
 	fmt.Printf("First row: a=%d b=%s\n", result.a, *result.b)
+
+	var resSlice MyTypeArray = make([]MyType, 2)
+
+	// Demonstrates reading back array of composites
+	err = conn.QueryRow(context.Background(), "select ARRAY[$1::mytype, (99, 'zzz')::mytype]",
+		pgx.QueryResultFormats{pgx.BinaryFormatCode}, MyType{1, ptrS("foo")}).
+		Scan(&resSlice)
+	E(err)
+
+	fmt.Printf("Array: 1=%s 2=%s\n", *resSlice[0].b, *resSlice[1].b)
 
 	// Because we scan into &*MyType, NULLs are handled generically by assigning nil to result
 	err = conn.QueryRow(context.Background(), "select NULL::mytype", pgx.QueryResultFormats{pgx.BinaryFormatCode}).Scan(&result)
@@ -97,5 +163,6 @@ create type mytype as (
 
 	// Output:
 	// First row: a=1 b=foo
+	// Array: 1=foo 2=zzz
 	// Second row: <nil>
 }

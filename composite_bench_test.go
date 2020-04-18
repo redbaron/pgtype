@@ -5,6 +5,8 @@ import (
 
 	"github.com/jackc/pgtype"
 	"github.com/jackc/pgtype/binary"
+	pgbinary "github.com/jackc/pgtype/binary"
+	errors "golang.org/x/xerrors"
 )
 
 type MyCompositeRaw struct {
@@ -28,6 +30,42 @@ func (src MyCompositeRaw) EncodeBinary(ci *pgtype.ConnInfo, buf []byte) (newBuf 
 		newBuf = binary.RecordAddNull(newBuf, pgtype.TextOID)
 	}
 	return
+}
+
+func (dst *MyCompositeRaw) DecodeBinary(ci *pgtype.ConnInfo, src []byte) (err error) {
+	return nil
+}
+
+type MyCompositeRawArray []MyCompositeRaw
+
+func (dst *MyCompositeRawArray) DecodeBinary(ci *pgtype.ConnInfo, src []byte) error {
+	if src == nil {
+		*dst = nil
+		return nil
+	}
+
+	it, elementCount, _, _, err := pgbinary.NewArrayIterator(src)
+	if err != nil {
+		return err
+	}
+
+	if len(*dst) < elementCount {
+		*dst = append(*dst, make(MyCompositeRawArray, (elementCount-len(*dst)))...)
+	}
+
+	for i := 0; len(it) > 0; i++ {
+		isNull, elemBytes, err := it.NextElem()
+		if err != nil {
+			return err
+		}
+		if isNull {
+			return errors.Errorf("ARRAY's %d th element is NULL, decode into slice of pointers instead", i)
+		}
+		if err = (*dst)[i].DecodeBinary(ci, elemBytes); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 var x []byte
